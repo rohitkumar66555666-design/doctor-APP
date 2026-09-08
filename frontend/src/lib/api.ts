@@ -1,7 +1,13 @@
-// Relative URLs — requests go to the same origin (Next.js), which proxies
-// to FastAPI via the rewrite rule in next.config.ts.
-// Works on localhost, Ngrok, or any other host with zero configuration.
-const API_BASE = "";
+// Live backend URL for production deployment (Vercel → Render).
+// Fall back to the Render service URL so API calls work even if the
+// environment variable is not set during local development.
+const BACKEND_URL =
+  process.env.NEXT_PUBLIC_BACKEND_URL ||
+  "https://doctor-app-j8og.onrender.com";
+
+// Absolute backend URL — no relative paths.
+// Vercel deploys use this directly; no Next.js proxy rewrite is required.
+export const API_BASE = BACKEND_URL;
 
 export async function transcribeAudio(audioBlob: Blob): Promise<string> {
   console.log(`[API] transcribeAudio → ${API_BASE}/api/transcribe, blob size: ${audioBlob.size}`);
@@ -36,8 +42,7 @@ export async function transcribeAudio(audioBlob: Blob): Promise<string> {
     if (error instanceof TypeError && error.message === "Failed to fetch") {
       throw new Error(
         `Cannot reach backend at ${API_BASE}. ` +
-        `Make sure your FastAPI server is running (uvicorn main:app --port 8000) ` +
-        `and that the URL in NEXT_PUBLIC_API_URL is correct.`
+        `Make sure your FastAPI server is running and accessible at that URL.`
       );
     }
     throw error;
@@ -94,7 +99,7 @@ export async function summarizeTranscript(
     if (error instanceof TypeError && error.message === "Failed to fetch") {
       throw new Error(
         `Cannot reach backend at ${API_BASE}. ` +
-        `Make sure your FastAPI server is running.`
+        `Make sure your FastAPI server is running and accessible at that URL.`
       );
     }
     throw error;
