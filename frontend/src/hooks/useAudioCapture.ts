@@ -22,11 +22,33 @@ interface UseAudioCaptureReturn {
   currentVolume: number;
 }
 
-// Extend window type for webkit SpeechRecognition
+// Extend window type for SpeechRecognition (cross-browser)
+interface SpeechRecognitionEvent extends Event {
+  resultIndex: number;
+  results: SpeechRecognitionResultList;
+}
+
+interface SpeechRecognitionErrorEvent extends Event {
+  error: string;
+}
+
+interface ISpeechRecognition extends EventTarget {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  maxAlternatives: number;
+  start(): void;
+  stop(): void;
+  onresult: ((event: SpeechRecognitionEvent) => void) | null;
+  onerror: ((event: SpeechRecognitionErrorEvent) => void) | null;
+  onend: (() => void) | null;
+}
+
 declare global {
   interface Window {
-    webkitSpeechRecognition: typeof SpeechRecognition;
-    SpeechRecognition: typeof SpeechRecognition;
+    webkitSpeechRecognition: new () => ISpeechRecognition;
+    SpeechRecognition: new () => ISpeechRecognition;
+    webkitAudioContext: typeof AudioContext;
   }
 }
 
@@ -50,7 +72,7 @@ export function useAudioCapture(): UseAudioCaptureReturn {
     silenceStartTime: number | null;
     audioContext: AudioContext | null;
     analyser: AnalyserNode | null;
-    dataArray: Uint8Array | null;
+    dataArray: Uint8Array<ArrayBuffer> | null;
     animationFrameId: number | null;
   }>({
     isSpeech: false,
@@ -71,7 +93,7 @@ export function useAudioCapture(): UseAudioCaptureReturn {
   const savedBlobRef = useRef<Blob | null>(null);
 
   // Web Speech API refs
-  const speechRecRef = useRef<SpeechRecognition | null>(null);
+  const speechRecRef = useRef<ISpeechRecognition | null>(null);
   const isRecordingRef = useRef(false);
 
   const wordCount = transcript ? transcript.split(/\s+/).filter(Boolean).length : 0;
@@ -106,7 +128,7 @@ export function useAudioCapture(): UseAudioCaptureReturn {
     rec.lang = "hi-IN"; // Hindi primary; browser will also pick up English
     rec.maxAlternatives = 1;
 
-    rec.onresult = (event) => {
+    rec.onresult = (event: SpeechRecognitionEvent) => {
       let interim = "";
       let finalText = "";
 
@@ -127,7 +149,7 @@ export function useAudioCapture(): UseAudioCaptureReturn {
       }
     };
 
-    rec.onerror = (event) => {
+    rec.onerror = (event: SpeechRecognitionErrorEvent) => {
       // network errors are common on free tiers — just log
       console.warn("[SpeechRec] Error:", event.error);
       if (event.error === "no-speech") {
@@ -261,7 +283,7 @@ export function useAudioCapture(): UseAudioCaptureReturn {
     const analyser = audioContext.createAnalyser();
     analyser.fftSize = 1024;
     source.connect(analyser);
-    const dataArray = new Uint8Array(analyser.frequencyBinCount);
+    const dataArray = new Uint8Array(analyser.frequencyBinCount) as Uint8Array<ArrayBuffer>;
 
     vadRef.current = {
       isSpeech: false,
