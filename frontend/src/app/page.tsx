@@ -98,9 +98,12 @@ export default function Home() {
 
   /* ---------- Transcribe all buffered chunks ---------- */
   const handleTranscribe = useCallback(async (): Promise<string> => {
+    // If we already have live transcript from Web Speech API, use it directly
+    if (audio.transcript.trim()) {
+      return audio.transcript.trim();
+    }
     if (audio.chunks.length === 0) return "";
     setTranscribing(true);
-    audio.setTranscript("");
     let finalTranscript = "";
 
     try {
@@ -110,7 +113,6 @@ export default function Home() {
         );
         const text = await transcribeAudio(audio.chunks[i]);
         finalTranscript = finalTranscript ? finalTranscript + " " + text : text;
-        // Replace the "transcribing…" placeholder with actual text
         audio.setTranscript((prev) => {
           const placeholder = `[Transcribing chunk ${i + 1}/${audio.chunks.length}...]`;
           const placeholder2 = `[chunk ${i + 1}/${audio.chunks.length}]`;
@@ -151,8 +153,9 @@ export default function Home() {
 
   /* ---------- Save recording ---------- */
   const handleSave = useCallback(() => {
-    if (audio.chunks.length === 0) return;
-    const blob = new Blob(audio.chunks, { type: "audio/webm" });
+    // Use the first chunk blob directly (already merged in onstop or during recording)
+    const blob = audio.chunks[0];
+    if (!blob) return;
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
@@ -402,7 +405,7 @@ export default function Home() {
           <div className="flex flex-col gap-3">
             <div className="flex gap-3">
               <Stat label="WORDS:" value={audio.wordCount} />
-              <Stat label="CHUNKS:" value={audio.chunkCount} />
+              <Stat label="REC KB:" value={audio.chunkCount} />
             </div>
             {/* VAD Volume Meter */}
             {audio.state === "recording" && (
@@ -416,7 +419,17 @@ export default function Home() {
               Live Transcript
             </label>
             <div className="flex-1 min-h-[200px] max-h-[50vh] overflow-y-auto rounded-xl border border-gray-200 bg-gray-50 p-4 font-mono text-sm leading-relaxed text-gray-800">
-              {audio.transcript || (
+              {audio.transcript || audio.interimTranscript ? (
+                <>
+                  <span>{audio.transcript}</span>
+                  {audio.interimTranscript && (
+                    <span className="text-indigo-400 italic">
+                      {audio.transcript ? " " : ""}
+                      {audio.interimTranscript}
+                    </span>
+                  )}
+                </>
+              ) : (
                 <span className="text-gray-400 italic">
                   Transcript will appear here as you speak…
                 </span>
@@ -445,9 +458,9 @@ export default function Home() {
             onClick={async () => {
               console.log("[UI] Process button clicked, chunks:", audio.chunks.length, "existing transcript:", audio.transcript.length > 0 ? "yes" : "no");
               let transcriptText = audio.transcript;
-              // Step 1: Transcribe audio chunks if we have recordings and no transcript yet
-              if (audio.chunks.length > 0 && !transcriptText) {
-                console.log("[UI] Step 1: Transcribing", audio.chunks.length, "chunk(s)...");
+              // Step 1: Only transcribe via Whisper if we have no live transcript
+              if (!transcriptText.trim() && audio.chunks.length > 0) {
+                console.log("[UI] Step 1: No live transcript — transcribing", audio.chunks.length, "chunk(s) via Whisper...");
                 transcriptText = await handleTranscribe();
                 console.log("[UI] Transcription result length:", transcriptText.length);
               }

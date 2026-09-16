@@ -11,49 +11,46 @@ interface UseAudioCaptureReturn {
   clear: () => void;
   transcript: string;
   setTranscript: React.Dispatch<React.SetStateAction<string>>;
+  /** Interim (live) text being spoken right now */
+  interimTranscript: string;
   chunks: Blob[];
   addTranscriptChunk: (text: string) => void;
   wordCount: number;
   chunkCount: number;
   status: string;
-  /** Whether speech is currently detected (for UI indicators) */
   isSpeechActive: boolean;
-  /** Current RMS volume level (0-1 range) for visualization */
   currentVolume: number;
 }
 
-/**
- * Manages microphone capture via MediaRecorder with Voice Activity Detection (VAD).
- * Uses Web Audio API (AnalyserNode) for real-time RMS-based speech detection.
- * Automatically filters out silence periods to reduce unnecessary API payload.
- *
- * Groq Whisper needs a properly structured media file — concatenating
- * incremental MediaRecorder fragments breaks the container format.
- */
+// Extend window type for webkit SpeechRecognition
+declare global {
+  interface Window {
+    webkitSpeechRecognition: typeof SpeechRecognition;
+    SpeechRecognition: typeof SpeechRecognition;
+  }
+}
+
 export function useAudioCapture(): UseAudioCaptureReturn {
   const [state, setState] = useState<RecordingState>("idle");
   const [chunks, setChunks] = useState<Blob[]>([]);
   const [transcript, setTranscript] = useState("");
-  const [status, setStatus] = useState(
-    "Ready — click Start Mic and speak naturally."
-  );
+  const [interimTranscript, setInterimTranscript] = useState("");
+  const [status, setStatus] = useState("Ready — click Start Mic and speak naturally.");
   const [isSpeechActive, setIsSpeechActive] = useState(false);
   const [currentVolume, setCurrentVolume] = useState(0);
 
-  // VAD Configuration
-  const VAD_THRESHOLD = 0.008; // RMS threshold for speech detection (lowered for normal mic input)
-  const VAD_COOLDOWN_MS = 300; // Minimum ms between silence->speech transitions
-  const SILENCE_TIMEOUT_MS = 1500; // Silence duration before pausing recording
-  const FALLBACK_TO_FULL_AUDIO = true; // If no speech detected, use all audio chunks
+  // VAD config
+  const VAD_THRESHOLD = 0.008;
+  const VAD_COOLDOWN_MS = 300;
+  const SILENCE_TIMEOUT_MS = 1500;
 
-  // Refs for VAD state management
   const vadRef = useRef<{
     isSpeech: boolean;
     lastTransitionTime: number;
     silenceStartTime: number | null;
     audioContext: AudioContext | null;
     analyser: AnalyserNode | null;
-    dataArray: Uint8Array<ArrayBuffer> | null;
+    dataArray: Uint8Array | null;
     animationFrameId: number | null;
   }>({
     isSpeech: false,
@@ -68,62 +65,128 @@ export function useAudioCapture(): UseAudioCaptureReturn {
   const streamRef = useRef<MediaStream | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const mimeTypeRef = useRef<string>("");
-  // All recorded data fragments live here until recording stops
   const recordedChunksRef = useRef<Blob[]>([]);
-  // Fallback: Store ALL raw chunks (including silence) for fallback if VAD fails
   const allRawChunksRef = useRef<Blob[]>([]);
+  // Stable ref for saved blob — so handleSave works even before state updates
+  const savedBlobRef = useRef<Blob | null>(null);
 
-  const wordCount = transcript
-    ? transcript.split(/\s+/).filter(Boolean).length
-    : 0;
-  const chunkCount = chunks.length;
+  // Web Speech API refs
+  const speechRecRef = useRef<SpeechRecognition | null>(null);
+  const isRecordingRef = useRef(false);
+
+  const wordCount = transcript ? transcript.split(/\s+/).filter(Boolean).length : 0;
+  // Show recording size in KB instead of blob count (more meaningful)
+  const chunkCount = chunks.length > 0 ? Math.round(chunks[0].size / 1024) : 0;
 
   const addTranscriptChunk = useCallback((text: string) => {
     setTranscript((prev) => (prev ? prev + " " + text : text));
   }, []);
 
-  // Cleanup VAD on unmount
   useEffect(() => {
     return () => {
       const vad = vadRef.current;
-      if (vad.animationFrameId !== null) {
-        cancelAnimationFrame(vad.animationFrameId);
+      if (vad.animationFrameId !== null) cancelAnimationFrame(vad.animationFrameId);
+      if (vad.audioContext) vad.audioContext.close();
+      if (speechRecRef.current) speechRecRef.current.stop();
+    };
+  }, []);
+
+  /** Start Web Speech API for live real-time display */
+  const startSpeechRecognition = useCallback(() => {
+    const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRec) {
+      console.warn("[SpeechRec] Web Speech API not supported in this browser");
+      return;
+    }
+
+    const rec = new SpeechRec();
+    rec.continuous = true;
+    rec.interimResults = true;
+    // Auto-detect Hindi and English
+    rec.lang = "hi-IN"; // Hindi primary; browser will also pick up English
+    rec.maxAlternatives = 1;
+
+    rec.onresult = (event) => {
+      let interim = "";
+      let finalText = "";
+
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const result = event.results[i];
+        if (result.isFinal) {
+          finalText += result[0].transcript + " ";
+        } else {
+          interim += result[0].transcript;
+        }
       }
-      if (vad.audioContext) {
-        vad.audioContext.close();
+
+      if (finalText) {
+        setTranscript((prev) => (prev ? prev + " " + finalText.trim() : finalText.trim()));
+        setInterimTranscript("");
+      } else {
+        setInterimTranscript(interim);
       }
     };
+
+    rec.onerror = (event) => {
+      // network errors are common on free tiers — just log
+      console.warn("[SpeechRec] Error:", event.error);
+      if (event.error === "no-speech") {
+        setInterimTranscript("");
+      }
+    };
+
+    rec.onend = () => {
+      setInterimTranscript("");
+      // Auto-restart if still recording
+      if (isRecordingRef.current) {
+        console.log("[SpeechRec] Restarting continuous recognition...");
+        try {
+          rec.start();
+        } catch {
+          // ignore if already started
+        }
+      }
+    };
+
+    speechRecRef.current = rec;
+    try {
+      rec.start();
+      console.log("[SpeechRec] Started continuous recognition (hi-IN / en)");
+    } catch (err) {
+      console.warn("[SpeechRec] Could not start:", err);
+    }
+  }, []);
+
+  const stopSpeechRecognition = useCallback(() => {
+    isRecordingRef.current = false;
+    if (speechRecRef.current) {
+      try { speechRecRef.current.stop(); } catch { /* ignore */ }
+      speechRecRef.current = null;
+    }
+    setInterimTranscript("");
   }, []);
 
   /* ----- stop capture ----- */
   const stop = useCallback(() => {
     console.log("[AudioCapture] stop() called");
+    isRecordingRef.current = false;
+    stopSpeechRecognition();
 
-    // Cancel VAD animation frame
     const vad = vadRef.current;
     if (vad.animationFrameId !== null) {
       cancelAnimationFrame(vad.animationFrameId);
       vad.animationFrameId = null;
     }
 
-    // Stop the MediaRecorder — this triggers ondataavailable (async)
-    // then onstop (async). We MUST NOT read recordedChunksRef here
-    // because ondataavailable hasn't fired yet.
     if (recorderRef.current && recorderRef.current.state !== "inactive") {
       recorderRef.current.stop();
     }
-    // recorderRef is cleared inside the onstop handler
 
-    // Stop all media tracks immediately (no new data will arrive)
     if (streamRef.current) {
-      streamRef.current.getTracks().forEach((track) => {
-        console.log(`[AudioCapture] Stopping track: ${track.kind} (${track.label})`);
-        track.stop();
-      });
+      streamRef.current.getTracks().forEach((t) => t.stop());
       streamRef.current = null;
     }
 
-    // Close audio context if open
     if (vad.audioContext) {
       vad.audioContext.close();
       vad.audioContext = null;
@@ -135,78 +198,48 @@ export function useAudioCapture(): UseAudioCaptureReturn {
     setIsSpeechActive(false);
     setCurrentVolume(0);
     setStatus("⏸️ Stopped — review transcript and click Process to summarise.");
-    console.log("[AudioCapture] Recording stop initiated, waiting for final data...");
-  }, []);
+  }, [stopSpeechRecognition]);
 
   /* ----- clear everything ----- */
   const clear = useCallback(() => {
     setChunks([]);
     setTranscript("");
+    setInterimTranscript("");
     recordedChunksRef.current = [];
     allRawChunksRef.current = [];
+    savedBlobRef.current = null;
     setStatus("Ready — click Start Mic and speak naturally.");
-    console.log("[AudioCapture] Cleared all data");
   }, []);
 
   /* ----- start capture ----- */
   const start = useCallback(async () => {
     console.log("[AudioCapture] start() called");
 
-    // Step 1: Check browser support
     if (!navigator?.mediaDevices?.getUserMedia) {
-      const msg =
-        "navigator.mediaDevices.getUserMedia is not available. " +
-        "This usually means the page is NOT served over HTTPS (or localhost).";
-      console.error("[AudioCapture]", msg);
-      setStatus(`❌ ${msg}`);
+      setStatus("❌ getUserMedia not available. Use HTTPS or localhost.");
       return;
     }
-
-    // Step 2: Check MediaRecorder support
     if (typeof MediaRecorder === "undefined") {
-      const msg = "MediaRecorder is not supported in this browser.";
-      console.error("[AudioCapture]", msg);
-      setStatus(`❌ ${msg}`);
+      setStatus("❌ MediaRecorder not supported in this browser.");
       return;
     }
 
-    // Step 3: Request mic permission
-    console.log("[AudioCapture] Requesting microphone permission...");
     setStatus("🎙️ Requesting microphone access...");
     setState("requesting");
 
     let stream: MediaStream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true,
-        },
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
       });
     } catch (err: unknown) {
-      console.error("[AudioCapture] getUserMedia failed:", err);
       let userMsg = "Unknown error";
       if (err instanceof DOMException) {
         switch (err.name) {
-          case "NotAllowedError":
-            userMsg =
-              "Microphone permission was denied. Please allow mic access in your browser settings and reload.";
-            break;
-          case "NotFoundError":
-            userMsg =
-              "No microphone found. Please connect a microphone and try again.";
-            break;
-          case "NotReadableError":
-            userMsg =
-              "Microphone is in use by another application. Close other apps using the mic and try again.";
-            break;
-          case "OverconstrainedError":
-            userMsg =
-              "The requested audio constraints cannot be satisfied by this device. Try a different microphone.";
-            break;
-          default:
-            userMsg = `${err.name}: ${err.message}`;
+          case "NotAllowedError": userMsg = "Microphone permission denied."; break;
+          case "NotFoundError": userMsg = "No microphone found."; break;
+          case "NotReadableError": userMsg = "Microphone in use by another app."; break;
+          default: userMsg = `${err.name}: ${err.message}`;
         }
       } else if (err instanceof Error) {
         userMsg = err.message;
@@ -216,116 +249,79 @@ export function useAudioCapture(): UseAudioCaptureReturn {
       return;
     }
 
-    console.log("[AudioCapture] Mic permission granted, tracks:", stream.getAudioTracks().length);
     streamRef.current = stream;
+    isRecordingRef.current = true;
 
-    // Step 4: Set up Web Audio API for VAD (Voice Activity Detection)
-    console.log("[AudioCapture] Setting up VAD with AnalyserNode...");
-    const audioContext = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
+    // Start live speech recognition (real-time display)
+    startSpeechRecognition();
+
+    // Set up VAD for volume visualization
+    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
     const source = audioContext.createMediaStreamSource(stream);
     const analyser = audioContext.createAnalyser();
-    analyser.fftSize = 1024; // Good balance between responsiveness and accuracy
-    const bufferLength = analyser.frequencyBinCount;
-    const dataArray = new Uint8Array(bufferLength);
-
+    analyser.fftSize = 1024;
     source.connect(analyser);
-    // Don't connect to destination - we don't want to output the audio
-    // (it would create feedback if monitoring)
+    const dataArray = new Uint8Array(analyser.frequencyBinCount);
+
     vadRef.current = {
       isSpeech: false,
       lastTransitionTime: Date.now(),
       silenceStartTime: null,
       audioContext,
       analyser,
-      dataArray: new Uint8Array(bufferLength),
+      dataArray,
       animationFrameId: null,
     };
 
-    // Start VAD monitoring loop
-    console.log("[AudioCapture] Starting VAD monitoring loop...");
     const vadLoop = () => {
-      if (!vadRef.current.analyser || !vadRef.current.dataArray) return;
+      const vad = vadRef.current;
+      if (!vad.analyser || !vad.dataArray) return;
 
-      // Get RMS (Root Mean Square) volume level
-      const currentDataArray = vadRef.current.dataArray;
-      if (!currentDataArray) return;
-      vadRef.current.analyser.getByteTimeDomainData(currentDataArray);
+      vad.analyser.getByteTimeDomainData(vad.dataArray);
       let sum = 0;
-      for (let i = 0; i < currentDataArray.length; i++) {
-        // Convert byte (0-255) to amplitude (-1 to 1)
-        const value = (currentDataArray[i] - 128) / 128;
-        sum += value * value;
+      for (let i = 0; i < vad.dataArray.length; i++) {
+        const v = (vad.dataArray[i] - 128) / 128;
+        sum += v * v;
       }
-      const rms = Math.sqrt(sum / currentDataArray.length);
-
-      // Update volume for UI visualization
+      const rms = Math.sqrt(sum / vad.dataArray.length);
       setCurrentVolume(rms);
 
-      // VAD logic: detect speech vs silence
       const now = Date.now();
-      const vad = vadRef.current;
-
       if (rms > VAD_THRESHOLD) {
-        // Speech detected
-        if (!vad.isSpeech) {
-          // Transition from silence to speech
-          if (now - vad.lastTransitionTime > VAD_COOLDOWN_MS) {
-            vad.isSpeech = true;
-            vad.silenceStartTime = null;
-            vad.lastTransitionTime = now;
-            setIsSpeechActive(true);
-            setStatus("🗣️ Speech detected — capturing audio");
-            console.log(`[AudioCapture] VAD: Speech started (RMS: ${rms.toFixed(4)})`);
-          }
+        if (!vad.isSpeech && now - vad.lastTransitionTime > VAD_COOLDOWN_MS) {
+          vad.isSpeech = true;
+          vad.silenceStartTime = null;
+          vad.lastTransitionTime = now;
+          setIsSpeechActive(true);
         }
-      } else {
-        // Silence detected
-        if (vad.isSpeech) {
-          // Start counting silence duration
-          if (vad.silenceStartTime === null) {
-            vad.silenceStartTime = now;
-          }
-
-          // If silence exceeds timeout, mark as paused
-          if (vad.silenceStartTime !== null && now - vad.silenceStartTime > SILENCE_TIMEOUT_MS) {
-            const silenceDuration = now - vad.silenceStartTime;
-            vad.isSpeech = false;
-            vad.silenceStartTime = null;
-            vad.lastTransitionTime = now;
-            setIsSpeechActive(false);
-            setStatus("⏸️ Silence detected — buffering paused");
-            console.log(`[AudioCapture] VAD: Silence timeout (silence: ${silenceDuration}ms)`);
-          }
+      } else if (vad.isSpeech) {
+        if (vad.silenceStartTime === null) vad.silenceStartTime = now;
+        if (now - vad.silenceStartTime > SILENCE_TIMEOUT_MS) {
+          vad.isSpeech = false;
+          vad.silenceStartTime = null;
+          vad.lastTransitionTime = now;
+          setIsSpeechActive(false);
         }
       }
 
-      // Continue monitoring
       vad.animationFrameId = requestAnimationFrame(vadLoop);
     };
     vadLoop();
 
-    // Step 5: Set up MediaRecorder
-    const mimeType =
-      MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-        ? "audio/webm;codecs=opus"
-        : MediaRecorder.isTypeSupported("audio/webm")
-          ? "audio/webm"
-          : "";
-
-    console.log("[AudioCapture] Using MIME type:", mimeType || "(browser default)");
+    // Set up MediaRecorder for full audio capture (for save + Whisper fallback)
+    const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+      ? "audio/webm;codecs=opus"
+      : MediaRecorder.isTypeSupported("audio/webm")
+        ? "audio/webm"
+        : "";
 
     let recorder: MediaRecorder;
     try {
-      recorder = mimeType
-        ? new MediaRecorder(stream, { mimeType })
-        : new MediaRecorder(stream);
+      recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
     } catch (err) {
-      console.error("[AudioCapture] MediaRecorder creation failed:", err);
       setStatus(`❌ Failed to create recorder: ${err instanceof Error ? err.message : err}`);
       stream.getTracks().forEach((t) => t.stop());
-      if (vadRef.current?.audioContext) {
-        vadRef.current.audioContext.close();
-      }
+      vadRef.current.audioContext?.close();
       setState("idle");
       return;
     }
@@ -333,87 +329,67 @@ export function useAudioCapture(): UseAudioCaptureReturn {
     recorderRef.current = recorder;
     mimeTypeRef.current = recorder.mimeType;
     recordedChunksRef.current = [];
+    allRawChunksRef.current = [];
 
-    // Collect data fragments — only push when speech is active (VAD filtering)
     recorder.ondataavailable = (event) => {
       if (event.data && event.data.size > 0) {
-        // Always store a copy in the raw buffer for fallback
         allRawChunksRef.current.push(event.data);
-        
-        // VAD Filtering: Only keep audio chunks when speech is active (VAD filtering)
         if (vadRef.current?.isSpeech) {
           recordedChunksRef.current.push(event.data);
-          console.log(`[AudioCapture] ondataavailable (speech): ${event.data.size} bytes (total: ${recordedChunksRef.current.length})`);
-        } else {
-          // Silently discard non-speech chunks from speech buffer to reduce payload
-          console.log(`[AudioCapture] ondataavailable (silence): ${event.data.size} bytes - DISCARDED (kept in fallback buffer)`);
         }
       }
     };
 
     recorder.onstop = () => {
-      console.log("[AudioCapture] MediaRecorder onstop fired, speech fragments:", recordedChunksRef.current.length);
-      // Cancel VAD animation frame
-      if (vadRef.current?.animationFrameId !== null) {
-        cancelAnimationFrame(vadRef.current.animationFrameId);
-        vadRef.current.animationFrameId = null;
+      // Cancel VAD loop if still running (may already be cancelled by stop())
+      const frameId = vadRef.current?.animationFrameId;
+      if (frameId !== null && frameId !== undefined) {
+        cancelAnimationFrame(frameId);
+        if (vadRef.current) vadRef.current.animationFrameId = null;
       }
-      // This fires AFTER the final ondataavailable, so all data is ready
+
       let finalChunks = recordedChunksRef.current.splice(0);
       const savedMimeType = mimeTypeRef.current;
       recorderRef.current = null;
       mimeTypeRef.current = "";
-      
-      // Fallback: If no speech chunks were captured, use ALL raw audio fragments
-      if (finalChunks.length === 0 && allRawChunksRef.current.length > 0 && FALLBACK_TO_FULL_AUDIO) {
-        console.warn("[AudioCapture] ⚠ No speech detected by VAD — falling back to FULL audio buffer");
-        console.log(`[AudioCapture] Fallback: Using ${allRawChunksRef.current.length} raw audio fragments`);
+
+      if (finalChunks.length === 0 && allRawChunksRef.current.length > 0) {
+        console.warn("[AudioCapture] VAD found no speech — using full audio");
         finalChunks = allRawChunksRef.current.splice(0);
-        setStatus("⚠️ VAD detected no speech — using full audio recording instead");
-      } else if (finalChunks.length === 0) {
-        console.warn("[AudioCapture] No audio data recorded at all");
-        setStatus("❌ No audio recorded. Please check your microphone and try again.");
       }
-      
-      // Clear raw chunks ref
       allRawChunksRef.current = [];
-      
+
       if (finalChunks.length > 0) {
         const blob = new Blob(finalChunks, { type: savedMimeType || "audio/webm" });
         if (blob.size > 100) {
-          const mode = finalChunks.length === recordedChunksRef.current.length + allRawChunksRef.current.length 
-            ? "(full audio - VAD fallback)" 
-            : "(speech only)";
-          console.log(`[AudioCapture] ✅ Final recording ${mode}: ${blob.size} bytes (${finalChunks.length} fragments)`);
+          // Store in ref AND state so save works immediately
+          savedBlobRef.current = blob;
           setChunks([blob]);
-          setStatus(savedMimeType ? "✅ Recording saved" : "✅ Recording saved");
+          setStatus("✅ Recording saved — click Process to get AI summary.");
         } else {
-          console.warn("[AudioCapture] Recording too small, discarding:", blob.size, "bytes");
           setChunks([]);
-          setStatus("⚠️ Recording too small. Try speaking for longer.");
+          savedBlobRef.current = null;
+          setStatus("⚠️ Recording too small. Try speaking longer.");
         }
       } else {
-        console.warn("[AudioCapture] No audio data recorded");
         setChunks([]);
+        savedBlobRef.current = null;
+        setStatus("❌ No audio recorded. Check your microphone.");
       }
     };
 
     recorder.onerror = (event) => {
-      console.error("[AudioCapture] MediaRecorder error:", event);
-      setStatus(`❌ Recorder error: ${event}`);
+      console.error("[AudioCapture] Recorder error:", event);
     };
 
-    // Step 6: Start recording (no timeslice — collect everything until stop)
+    // Use timeslice so we accumulate chunks during recording (also fixes save during recording)
     try {
-      recorder.start();
-      console.log("[AudioCapture] MediaRecorder started, state:", recorder.state);
+      recorder.start(1000); // collect a chunk every 1s
+      console.log("[AudioCapture] MediaRecorder started with 1s timeslice");
     } catch (err) {
-      console.error("[AudioCapture] recorder.start() failed:", err);
       setStatus(`❌ Failed to start recording: ${err instanceof Error ? err.message : err}`);
       stream.getTracks().forEach((t) => t.stop());
-      if (vadRef.current?.audioContext) {
-        vadRef.current.audioContext.close();
-      }
+      vadRef.current.audioContext?.close();
       setState("idle");
       return;
     }
@@ -421,9 +397,8 @@ export function useAudioCapture(): UseAudioCaptureReturn {
     setState("recording");
     setIsSpeechActive(false);
     setCurrentVolume(0);
-    setStatus("🎙️ Recording — speak now. VAD is active.");
-    console.log("[AudioCapture] Recording state set to 'recording', VAD active");
-  }, []);
+    setStatus("🎙️ Recording — speak in Hindi or English, text appears instantly.");
+  }, [startSpeechRecognition]);
 
   return {
     state,
@@ -432,6 +407,7 @@ export function useAudioCapture(): UseAudioCaptureReturn {
     clear,
     transcript,
     setTranscript,
+    interimTranscript,
     chunks,
     addTranscriptChunk,
     wordCount,
