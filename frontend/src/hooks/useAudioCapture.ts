@@ -59,7 +59,6 @@ export function useAudioCapture(): UseAudioCaptureReturn {
   const streamRef = useRef<MediaStream | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const mimeTypeRef = useRef<string>("");
-  const recordedChunksRef = useRef<Blob[]>([]);
   const allRawChunksRef = useRef<Blob[]>([]);
   const savedBlobRef = useRef<Blob | null>(null);
 
@@ -112,7 +111,6 @@ export function useAudioCapture(): UseAudioCaptureReturn {
   const clear = useCallback(() => {
     setChunks([]);
     setTranscript("");
-    recordedChunksRef.current = [];
     allRawChunksRef.current = [];
     savedBlobRef.current = null;
     setStatus("Ready — click Start Mic and speak naturally.");
@@ -231,15 +229,13 @@ export function useAudioCapture(): UseAudioCaptureReturn {
 
     recorderRef.current = recorder;
     mimeTypeRef.current = recorder.mimeType;
-    recordedChunksRef.current = [];
     allRawChunksRef.current = [];
 
+    // Collect ALL chunks — no VAD filtering on chunks (VAD only for UI indicators)
+    // Merging partial WebM chunks causes invalid_media_file errors on Groq
     recorder.ondataavailable = (event) => {
       if (event.data && event.data.size > 0) {
         allRawChunksRef.current.push(event.data);
-        if (vadRef.current?.isSpeech) {
-          recordedChunksRef.current.push(event.data);
-        }
       }
     };
 
@@ -250,16 +246,10 @@ export function useAudioCapture(): UseAudioCaptureReturn {
         if (vadRef.current) vadRef.current.animationFrameId = null;
       }
 
-      let finalChunks = recordedChunksRef.current.splice(0);
+      const finalChunks = allRawChunksRef.current.splice(0);
       const savedMimeType = mimeTypeRef.current;
       recorderRef.current = null;
       mimeTypeRef.current = "";
-
-      if (finalChunks.length === 0 && allRawChunksRef.current.length > 0) {
-        console.warn("[AudioCapture] VAD found no speech — using full audio");
-        finalChunks = allRawChunksRef.current.splice(0);
-      }
-      allRawChunksRef.current = [];
 
       if (finalChunks.length > 0) {
         const blob = new Blob(finalChunks, { type: savedMimeType || "audio/webm" });
@@ -284,7 +274,8 @@ export function useAudioCapture(): UseAudioCaptureReturn {
     };
 
     try {
-      recorder.start(1000);
+      // No timeslice — single blob at stop(), avoids WebM container fragmentation
+      recorder.start();
     } catch (err) {
       setStatus(`❌ Failed to start recording: ${err instanceof Error ? err.message : err}`);
       stream.getTracks().forEach((t) => t.stop());
