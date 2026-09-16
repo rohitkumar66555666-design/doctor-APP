@@ -3,7 +3,7 @@
 import { useCallback, useState } from "react";
 import { useAudioCapture } from "@/hooks/useAudioCapture";
 import { transcribeAudio, summarizeTranscript } from "@/lib/api";
-import type { MedicalSummary, TranscribeLanguage } from "@/lib/api";
+import type { MedicalSummary } from "@/lib/api";
 
 /* ------------------------------------------------------------------ */
 /*  Small reusable pieces                                              */
@@ -85,19 +85,11 @@ function TagList({ items }: { items: string[] }) {
 /*  Main page                                                          */
 /* ------------------------------------------------------------------ */
 
-/* Language options for transcription */
-const LANGUAGES: { value: TranscribeLanguage; label: string }[] = [
-  { value: "auto", label: "🌐 Auto" },
-  { value: "en", label: "🇬🇧 English" },
-  { value: "hi", label: "हिन्दी" },
-];
-
 export default function Home() {
   const audio = useAudioCapture();
   const [summary, setSummary] = useState<MedicalSummary | null>(null);
   const [processing, setProcessing] = useState(false);
   const [transcribing, setTranscribing] = useState(false);
-  const [language, setLanguage] = useState<TranscribeLanguage>("auto");
 
   // VAD visual state for status bar
   const vadStatusText = audio.state === "recording"
@@ -119,7 +111,7 @@ export default function Home() {
         audio.setTranscript((prev) =>
           prev ? prev + ` [chunk ${i + 1}/${audio.chunks.length}]` : `[Transcribing chunk ${i + 1}/${audio.chunks.length}...]`
         );
-        const text = await transcribeAudio(audio.chunks[i], language);
+        const text = await transcribeAudio(audio.chunks[i]);
         finalTranscript = finalTranscript ? finalTranscript + " " + text : text;
         audio.setTranscript((prev) => {
           const placeholder = `[Transcribing chunk ${i + 1}/${audio.chunks.length}...]`;
@@ -138,7 +130,7 @@ export default function Home() {
       setTranscribing(false);
     }
     return finalTranscript;
-  }, [audio, language]);
+  }, [audio]);
 
   /* ---------- Summarise ---------- */
   const handleSummarise = useCallback(async (text?: string) => {
@@ -414,29 +406,6 @@ export default function Home() {
             <div className="flex gap-3">
               <Stat label="WORDS:" value={audio.wordCount} />
               <Stat label="CHUNKS:" value={audio.chunkCount} />
-            </div>
-
-            {/* Language selector */}
-            <div className="flex items-center gap-2">
-              <span className="text-xs font-bold uppercase tracking-wider text-gray-500">
-                Language:
-              </span>
-              <div className="flex gap-1.5">
-                {LANGUAGES.map((l) => (
-                  <button
-                    key={l.value}
-                    onClick={() => setLanguage(l.value)}
-                    className={`rounded-lg px-3 py-1.5 text-sm font-semibold transition ${
-                      language === l.value
-                        ? "bg-indigo-600 text-white shadow"
-                        : "bg-gray-100 text-gray-600 hover:bg-gray-200"
-                    }`}
-                  >
-                    {l.label}
-                    {l.value === "hi" && language === "hi" ? " ✓" : ""}
-                  </button>
-                ))}
-              </div>
             </div>
 
             {/* VAD Volume Meter */}
