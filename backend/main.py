@@ -9,7 +9,7 @@ For Render deployment, the PORT environment variable is set automatically.
 
 import os
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from openai import APIStatusError
 
@@ -34,12 +34,22 @@ async def health():
 
 
 @app.post("/api/transcribe", response_model=TranscriptResponse)
-async def api_transcribe(audio: UploadFile = File(...)):
-    """Accept an audio blob, send it to Groq Whisper, and return the transcript."""
+async def api_transcribe(
+    audio: UploadFile = File(...),
+    language: str = Form("auto"),
+):
+    """
+    Accept an audio blob and send it to Groq Whisper.
+
+    `language` form field:
+      - "auto" -> Whisper auto-detects (with strong Hindi fallback)
+      - "en"   -> force English transcription
+      - "hi"   -> force Hindi transcription
+    """
     audio_bytes = await audio.read()
     filename = audio.filename or "recording.webm"
     try:
-        transcript = await transcribe_audio(audio_bytes, filename)
+        transcript = await transcribe_audio(audio_bytes, filename, language=language)
     except APIStatusError as e:
         raise HTTPException(
             status_code=e.status_code,

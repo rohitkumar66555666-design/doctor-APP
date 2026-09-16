@@ -30,11 +30,20 @@ async function fetchWithRetry(
   throw new Error("All retries exhausted");
 }
 
-export async function transcribeAudio(audioBlob: Blob): Promise<string> {
-  console.log(`[API] transcribeAudio → ${API_BASE}/api/transcribe, blob size: ${audioBlob.size}`);
+/** Supported transcription languages. "auto" = let Whisper detect (with Hindi fallback). */
+export type TranscribeLanguage = "auto" | "en" | "hi";
+
+export async function transcribeAudio(
+  audioBlob: Blob,
+  language: TranscribeLanguage = "auto"
+): Promise<string> {
+  console.log(
+    `[API] transcribeAudio → ${API_BASE}/api/transcribe, blob size: ${audioBlob.size}, lang: ${language}`
+  );
 
   const formData = new FormData();
   formData.append("audio", audioBlob, "recording.webm");
+  formData.append("language", language);
 
   try {
     const res = await fetchWithRetry(`${API_BASE}/api/transcribe`, {

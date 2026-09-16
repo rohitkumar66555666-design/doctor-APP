@@ -22,8 +22,61 @@ http_client = httpx.Client()
 client = Groq(api_key=api_key, http_client=http_client) if api_key else None
 
 
-async def transcribe_audio(audio_bytes: bytes, filename: str = "recording.webm") -> str:
-    """Send audio bytes to Groq Whisper and return the transcript text."""
+# Languages we explicitly support forcing (ISO-639-1 codes)
+SUPPORTED_LANGUAGES = {"en", "hi"}
+
+
+def _whisper_transcribe(audio_bytes: bytes, filename: str, language: str | None = None):
+    """Low-level Groq Whisper call. verbose_json gives us detected language + segment confidences."""
+    kwargs: dict = {
+        "file": (filename, audio_bytes),
+        "model": "whisper-large-v3-turbo",
+        "response_format": "verbose_json",
+        "temperature": 0.0,
+    }
+    if language:
+        kwargs["language"] = language  # Force Whisper to decode in this language
+    return client.audio.transcriptions.create(**kwargs)
+
+
+def _segment_confidence(response) -> tuple[float, float]:
+    """Return (avg_logprob, avg_no_speech_prob) across segments. Closer-to-0 logprob = better."""
+    segments = getattr(response, "segments", None) or []
+    logprobs: list[float] = []
+    no_speech: list[float] = []
+    for seg in segments:
+        if isinstance(seg, dict):
+            lp, ns = seg.get("avg_logprob"), seg.get("no_speech_prob")
+        else:
+            lp, ns = getattr(seg, "avg_logprob", None), getattr(seg, "no_speech_prob", None)
+        if lp is not None:
+            logprobs.append(float(lp))
+        if ns is not None:
+            no_speech.append(float(ns))
+    avg_lp = sum(logprobs) / len(logprobs) if logprobs else -1.0
+    avg_ns = sum(no_speech) / len(no_speech) if no_speech else 0.0
+    return avg_lp, avg_ns
+
+
+def _has_devanagari(text: str) -> bool:
+    """True if the text contains Devanagari (Hindi) characters."""
+    return any("\u0900" <= ch <= "\u097f" for ch in text)
+
+
+async def transcribe_audio(
+    audio_bytes: bytes,
+    filename: str = "recording.webm",
+    language: str = "auto",
+) -> str:
+    """
+    Language-aware transcription:
+      - language="en"/"hi"  -> Whisper is FORCED to decode in that language (most reliable).
+      - language="auto"     -> Whisper auto-detects, with a strong Hindi fallback:
+                               * If it detects some other language (Indian users), retry as Hindi.
+                               * If it detects English but confidence is low AND the Hindi pass
+                                 scores clearly better, prefer the Hindi transcript (fixes the
+                                 common "Hindi speech -> English text" mis-detection).
+    """
     if not client:
         raise ValueError("GROQ_API_KEY is missing. Please check your backend/.env file.")
 
@@ -31,13 +84,39 @@ async def transcribe_audio(audio_bytes: bytes, filename: str = "recording.webm")
     if not filename.endswith((".webm", ".mp4", ".ogg", ".wav", ".m4a", ".mp3")):
         whisper_filename = "recording.webm"
 
-    # Send audio to Groq Whisper Large V3 Turbo
-    transcription = client.audio.transcriptions.create(
-        file=(whisper_filename, audio_bytes),
-        model="whisper-large-v3-turbo",
-        response_format="json",
-    )
-    return transcription.text
+    lang = (language or "auto").strip().lower()
+
+    # ---- 1. Explicit language: force decoding (strongest, zero ambiguity) ----
+    if lang in SUPPORTED_LANGUAGES:
+        response = _whisper_transcribe(audio_bytes, whisper_filename, language=lang)
+        return (response.text or "").strip()
+
+    # ---- 2. Auto mode: let Whisper detect the language ----
+    response = _whisper_transcribe(audio_bytes, whisper_filename)
+    detected = (getattr(response, "language", "") or "").lower()
+    text = (response.text or "").strip()
+
+    # ---- 3. Detected some other language (mr, bn, pa...) -> Indian users, retry as Hindi ----
+    if detected and detected not in SUPPORTED_LANGUAGES:
+        retry = _whisper_transcribe(audio_bytes, whisper_filename, language="hi")
+        return ((retry.text or "") or text).strip()
+
+    # ---- 4. English detected but low confidence -> try Hindi, keep the better one ----
+    if detected == "en":
+        lp1, ns1 = _segment_confidence(response)
+        low_confidence = lp1 < -0.75 or ns1 > 0.35
+        # Devanagari in the "English" text means it's actually Hinglish — already fine
+        if low_confidence and not _has_devanagari(text):
+            retry = _whisper_transcribe(audio_bytes, whisper_filename, language="hi")
+            lp2, ns2 = _segment_confidence(retry)
+            # Combined score: less-negative logprob and lower no-speech = better transcript.
+            # Require a clear margin (+0.05) before switching, to avoid false flips.
+            score1 = lp1 - (0.5 * ns1)
+            score2 = lp2 - (0.5 * ns2)
+            if score2 > score1 + 0.05:
+                return (retry.text or text).strip()
+
+    return text
 
 
 def _clean_json(raw: str) -> dict:
